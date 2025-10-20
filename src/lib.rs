@@ -1,22 +1,25 @@
+#[cfg(not(loom))]
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::{
-    array, iter,
+    array,
+    future::poll_fn,
+    iter,
     marker::PhantomData,
+    mem,
     ops::Add,
     sync::{Arc, Mutex},
-};
-#[cfg(not(loom))]
-use std::{
-    sync::atomic::{AtomicU64, AtomicU8, Ordering},
-    thread,
-    thread::Thread,
+    task::Poll,
 };
 
 use crossbeam_utils::CachePadded;
+#[cfg(not(loom))]
+use futures_executor::block_on;
+#[cfg(not(loom))]
+use futures_util::task::AtomicWaker;
 #[cfg(loom)]
 use loom::{
+    future::{block_on, AtomicWaker},
     sync::atomic::{AtomicU64, AtomicU8, Ordering},
-    thread,
-    thread::Thread,
 };
 
 pub trait HistogramValue: Clone + Add<Output = Self> + PartialOrd + Sized {
@@ -66,23 +69,23 @@ impl<T: HistogramValue> Histogram<T> {
             shard_index: AtomicU8::new(0),
             shards,
             collector: Mutex::new(()),
-            parked: Mutex::new(None),
+            waker: AtomicWaker::new(),
         }))
     }
 
     pub fn observe(&self, value: T) {
         let bucket_index = self.0.buckets.iter().position(|b| value <= *b).unwrap();
         let shard_index = self.0.shard_index.load(Ordering::Relaxed) as usize;
-        self.0.shards[shard_index].observe(value, bucket_index, &self.0.parked);
+        self.0.shards[shard_index].observe(value, bucket_index, &self.0.waker);
     }
 
     pub fn collect(&self) -> (u64, T, Vec<(T, u64)>) {
         let _guard = self.0.collector.lock().unwrap();
         self.0.shard_index.store(1, Ordering::Relaxed);
         let bucket_count = self.0.buckets.len();
-        let (count0, sum0, buckets0) = self.0.shards[0].collect(bucket_count, &self.0.parked);
+        let (count0, sum0, buckets0) = self.0.shards[0].collect(bucket_count, &self.0.waker);
         self.0.shard_index.store(0, Ordering::Relaxed);
-        let (count1, sum1, buckets1) = self.0.shards[1].collect(bucket_count, &self.0.parked);
+        let (count1, sum1, buckets1) = self.0.shards[1].collect(bucket_count, &self.0.waker);
         (
             count0 + count1,
             sum0 + sum1,
@@ -106,9 +109,7 @@ pub struct HistogramInner<T> {
     shard_index: AtomicU8,
     shards: [Shard<T>; 2],
     collector: Mutex<()>,
-    // `parked` access could be synchronized using `count` counter,
-    // but it is not used in hot path, so we can afford a mutex to avoid unsafe code
-    parked: Mutex<Option<Thread>>,
+    waker: AtomicWaker,
 }
 
 const COUNTERS_PER_CACHE_LINE: usize = align_of::<CachePadded<()>>() / align_of::<AtomicU64>();
@@ -161,18 +162,16 @@ impl<T: HistogramValue> Shard<T> {
             .take(bucket_count)
     }
 
-    fn observe(&self, value: T, bucket_index: usize, parked: &Mutex<Option<Thread>>) {
+    fn observe(&self, value: T, bucket_index: usize, waker: &AtomicWaker) {
         self.bucket(bucket_index).fetch_add(1, Ordering::Relaxed);
         T::inc_by(self.sum(), value, Ordering::Release);
         let count = self.count().fetch_add(1, Ordering::AcqRel);
         if count & PARKED_FLAG != 0 {
             #[cold]
-            fn unpark(parked: &Mutex<Option<Thread>>) {
-                if let Some(thread) = parked.lock().unwrap().take() {
-                    thread.unpark();
-                }
+            fn unpark(waker: &AtomicWaker) {
+                waker.wake();
             }
-            unpark(parked);
+            unpark(waker);
         }
     }
 
@@ -187,7 +186,7 @@ impl<T: HistogramValue> Shard<T> {
         (sum, expected_count)
     }
 
-    fn collect(&self, bucket_count: usize, parked: &Mutex<Option<Thread>>) -> (u64, T, Vec<u64>) {
+    fn collect(&self, bucket_count: usize, waker: &AtomicWaker) -> (u64, T, Vec<u64>) {
         let mut buckets = vec![0; bucket_count];
         for _ in 0..SPIN_LOOP_LIMIT {
             let count = self.count().load(Ordering::Acquire) & COUNT_MASK;
@@ -196,27 +195,29 @@ impl<T: HistogramValue> Shard<T> {
                 return (count, sum, buckets);
             }
         }
-        self.collect_cold(buckets, parked)
+        self.collect_cold(&mut buckets, waker)
     }
 
     #[cold]
-    fn collect_cold(
-        &self,
-        mut buckets: Vec<u64>,
-        parked: &Mutex<Option<Thread>>,
-    ) -> (u64, T, Vec<u64>) {
-        loop {
-            parked.lock().unwrap().replace(thread::current());
+    fn collect_cold(&self, buckets: &mut Vec<u64>, waker: &AtomicWaker) -> (u64, T, Vec<u64>) {
+        block_on(poll_fn(move |cx| {
+            #[cfg(not(loom))]
+            waker.register(cx.waker());
+            #[cfg(loom)]
+            waker.register(cx.waker().clone());
             let count = self.count().fetch_or(PARKED_FLAG, Ordering::AcqRel) & COUNT_MASK;
-            let (sum, expected_count) = self.read_sum_and_buckets(&mut buckets);
+            let (sum, expected_count) = self.read_sum_and_buckets(buckets);
             if count == expected_count {
                 if self.count().fetch_and(COUNT_MASK, Ordering::Relaxed) & PARKED_FLAG != 0 {
-                    parked.lock().unwrap().take();
+                    #[cfg(not(loom))]
+                    waker.take();
+                    #[cfg(loom)]
+                    waker.take_waker();
                 }
-                return (count, sum, buckets);
+                return Poll::Ready((count, sum, mem::take(buckets)));
             }
-            thread::park();
-        }
+            Poll::Pending
+        }))
     }
 }
 
