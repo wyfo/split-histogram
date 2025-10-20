@@ -227,12 +227,13 @@ mod tests {
 
     #[cfg(loom)]
     use loom::{model, thread};
+
+    use crate::Histogram;
+
     #[cfg(not(loom))]
     fn model(f: impl Fn()) {
         f();
     }
-
-    use crate::Histogram;
 
     #[test]
     fn observe_and_collect() {
@@ -263,6 +264,7 @@ mod tests {
         });
     }
 
+    #[cfg(not(loom))]
     #[test]
     fn observe_inf() {
         let histogram = Histogram::new([0.1, 1.0]);
@@ -270,6 +272,7 @@ mod tests {
         histogram.observe(f64::NEG_INFINITY);
     }
 
+    #[cfg(not(loom))]
     #[test]
     #[should_panic]
     fn observe_nan() {
