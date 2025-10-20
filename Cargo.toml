@@ -1,0 +1,14 @@
+[package]
+name = "histogram"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+crossbeam-utils = "0.8"
+
+[target."cfg(loom)".dependencies]
+loom = "0.7"
+
+[lints.rust]
+#unsafe_code = "forbid"
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
