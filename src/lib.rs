@@ -117,8 +117,8 @@ const COUNTERS_PER_CACHE_LINE: usize = align_of::<CachePadded<()>>() / align_of:
 const SPIN_LOOP_LIMIT: usize = 10;
 #[cfg(loom)]
 const SPIN_LOOP_LIMIT: usize = 1;
-const PARKED_FLAG: u64 = 1 << (u64::BITS - 1);
-const COUNT_MASK: u64 = !PARKED_FLAG;
+const WAITING_FLAG: u64 = 1 << (u64::BITS - 1);
+const COUNT_MASK: u64 = !WAITING_FLAG;
 
 #[derive(Debug)]
 pub struct Shard<T> {
@@ -166,7 +166,7 @@ impl<T: HistogramValue> Shard<T> {
         self.bucket(bucket_index).fetch_add(1, Ordering::Relaxed);
         T::inc_by(self.sum(), value, Ordering::Release);
         let count = self.count().fetch_add(1, Ordering::AcqRel);
-        if count & PARKED_FLAG != 0 {
+        if count & WAITING_FLAG != 0 {
             #[cold]
             fn unpark(waker: &AtomicWaker) {
                 waker.wake();
@@ -205,10 +205,10 @@ impl<T: HistogramValue> Shard<T> {
             waker.register(cx.waker());
             #[cfg(loom)]
             waker.register(cx.waker().clone());
-            let count = self.count().fetch_or(PARKED_FLAG, Ordering::AcqRel) & COUNT_MASK;
+            let count = self.count().fetch_or(WAITING_FLAG, Ordering::AcqRel) & COUNT_MASK;
             let (sum, expected_count) = self.read_sum_and_buckets(buckets);
             if count == expected_count {
-                if self.count().fetch_and(COUNT_MASK, Ordering::Relaxed) & PARKED_FLAG != 0 {
+                if self.count().fetch_and(COUNT_MASK, Ordering::Relaxed) & WAITING_FLAG != 0 {
                     #[cfg(not(loom))]
                     waker.take();
                     #[cfg(loom)]
