@@ -4,7 +4,7 @@ This repository is an experimental implementation of an optimized [Prometheus hi
 
 - **Lock-Free Critical Path**: Requires only **three** atomic fetch-and-add operations per observation.
 - **Cache-Friendliness**: Groups all atomic counters within the same cache line.
-- 
+
 ## Table of Contents
 - [State of the Art](#state-of-the-art)
 - [Algorithm](#algorithm)
