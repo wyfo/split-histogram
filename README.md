@@ -4,6 +4,18 @@ This repository is an experimental implementation of an optimized [Prometheus hi
 
 - **Lock-Free Critical Path**: Requires only **three** atomic fetch-and-add operations per observation.
 - **Cache-Friendliness**: Groups all atomic counters within the same cache line.
+- 
+## Table of Contents
+- [State of the Art](#state-of-the-art)
+- [Algorithm](#algorithm)
+  - [Reading a Consistent State](#reading-a-consistent-state)
+  - [Breaking the Reading Loop](#breaking-the-reading-loop)
+    - [Observation Order Inversion Edge Case](#observation-order-inversion-edge-case)
+  - [Avoiding Unbounded Spinning](#avoiding-unbounded-spinning)
+  - [Cache Locality](#cache-locality)
+  - [Testing](#testing)
+  - [NaN Support](#nan-support)
+- [Disclaimer](#disclaimer)
 
 ## State of the Art
 
