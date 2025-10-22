@@ -3,7 +3,7 @@
 This repository is an experimental implementation of an optimized [Prometheus histogram](https://prometheus.io/docs/concepts/metric_types/#histogram). The algorithm achieves the following key properties:
 
 - **Lock-Free Critical Path**: Requires only **three** atomic fetch-and-add operations per observation.
-- **Cache-Friendliness**: Groups all atomic counters within the same cache line.
+- **Cache Locality**: Groups all atomic counters within the same cache line.
 
 ## Table of Contents
 - [State of the Art](#state-of-the-art)
