@@ -25,7 +25,7 @@ use loom::{
 pub trait HistogramValue: Clone + Add<Output = Self> + PartialOrd + Sized {
     const MAX: Self;
     fn from_bits(bits: u64) -> Self;
-    fn inc_by(counter: &AtomicU64, value: Self, ordering: Ordering);
+    fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering);
 }
 
 impl HistogramValue for u64 {
@@ -34,7 +34,7 @@ impl HistogramValue for u64 {
         bits
     }
 
-    fn inc_by(counter: &AtomicU64, value: Self, ordering: Ordering) {
+    fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering) {
         counter.fetch_add(value, ordering);
     }
 }
@@ -45,7 +45,7 @@ impl HistogramValue for f64 {
         f64::from_bits(bits)
     }
 
-    fn inc_by(counter: &AtomicU64, value: Self, ordering: Ordering) {
+    fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering) {
         counter
             .fetch_update(ordering, Ordering::Relaxed, |c| {
                 Some(f64::to_bits(f64::from_bits(c) + value))
@@ -104,7 +104,7 @@ impl<T> Clone for Histogram<T> {
 }
 
 #[derive(Debug)]
-pub struct HistogramInner<T> {
+struct HistogramInner<T> {
     buckets: Vec<T>,
     shard_index: AtomicU8,
     shards: [Shard<T>; 2],
@@ -121,7 +121,7 @@ const WAITING_FLAG: u64 = 1 << (u64::BITS - 1);
 const COUNT_MASK: u64 = !WAITING_FLAG;
 
 #[derive(Debug)]
-pub struct Shard<T> {
+struct Shard<T> {
     // all counters should be stored on the same cache line to optimize grouped atomic operations
     // they are stored in the following order:
     // - _count
@@ -164,14 +164,14 @@ impl<T: HistogramValue> Shard<T> {
 
     fn observe(&self, value: T, bucket_index: usize, waker: &AtomicWaker) {
         self.bucket(bucket_index).fetch_add(1, Ordering::Relaxed);
-        T::inc_by(self.sum(), value, Ordering::Release);
+        T::atomic_add(self.sum(), value, Ordering::Release);
         let count = self.count().fetch_add(1, Ordering::AcqRel);
         if count & WAITING_FLAG != 0 {
             #[cold]
-            fn unpark(waker: &AtomicWaker) {
+            fn wake(waker: &AtomicWaker) {
                 waker.wake();
             }
-            unpark(waker);
+            wake(waker);
         }
     }
 
