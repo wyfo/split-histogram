@@ -64,7 +64,16 @@ impl GoHistogram {
     }
 }
 
-const SPIN_LIMITS: &[Option<usize>] = &[None, Some(0), Some(1), Some(10), Some(100), Some(1000)];
+const SPIN_LIMITS: &[Option<usize>] = &[
+    None,
+    Some(0),
+    Some(1),
+    Some(2),
+    Some(4),
+    Some(8),
+    Some(64),
+    Some(1024),
+];
 
 fn bench<H: Sync>(
     bencher: Bencher,
