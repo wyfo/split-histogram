@@ -165,7 +165,7 @@ impl<T: HistogramValue> Shard<T> {
     fn observe(&self, value: T, bucket_index: usize, waker: &AtomicWaker) {
         self.bucket(bucket_index).fetch_add(1, Ordering::Relaxed);
         T::atomic_add(self.sum(), value, Ordering::Release);
-        let count = self.count().fetch_add(1, Ordering::AcqRel);
+        let count = self.count().fetch_add(1, Ordering::Release);
         if count & WAITING_FLAG != 0 {
             #[cold]
             fn wake(waker: &AtomicWaker) {
@@ -205,7 +205,7 @@ impl<T: HistogramValue> Shard<T> {
             waker.register(cx.waker());
             #[cfg(loom)]
             waker.register(cx.waker().clone());
-            let count = self.count().fetch_or(WAITING_FLAG, Ordering::AcqRel) & COUNT_MASK;
+            let count = self.count().fetch_or(WAITING_FLAG, Ordering::Acquire) & COUNT_MASK;
             let (sum, expected_count) = self.read_sum_and_buckets(buckets);
             if count == expected_count {
                 if self.count().fetch_and(COUNT_MASK, Ordering::Relaxed) & WAITING_FLAG != 0 {
