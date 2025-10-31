@@ -265,6 +265,31 @@ mod tests {
         });
     }
 
+    #[cfg(loom)]
+    #[test]
+    fn double_collect_edge_case() {
+        let edge_case = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let edge_case2 = edge_case.clone();
+        model(move || {
+            let histogram = Histogram::new([10, 100]);
+            let h1 = histogram.clone();
+            let t1 = thread::spawn(move || {
+                h1.observe(7);
+                h1.observe(42)
+            });
+            let (_, sum1, _) = histogram.collect();
+            let (_, sum2, _) = histogram.collect();
+            edge_case2.fetch_or(
+                sum1 == 0 && sum2 == 42,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            t1.join().unwrap();
+            let (_, sum, _) = histogram.collect();
+            assert_eq!(sum, 49);
+        });
+        assert!(edge_case.load(std::sync::atomic::Ordering::Relaxed));
+    }
+
     #[cfg(not(loom))]
     #[test]
     fn observe_inf() {
