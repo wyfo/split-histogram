@@ -10,7 +10,6 @@ This repository is an experimental implementation of an optimized [Prometheus hi
 - [Algorithm](#algorithm)
   - [Reading a Consistent State](#reading-a-consistent-state)
   - [Breaking the Reading Loop](#breaking-the-reading-loop)
-    - [Observation Order Inversion Edge Case](#observation-order-inversion-edge-case)
   - [Avoiding Unbounded Spinning](#avoiding-unbounded-spinning)
   - [Cache Locality](#cache-locality)
   - [Testing](#testing)
