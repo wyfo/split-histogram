@@ -81,11 +81,11 @@ The algorithm’s correctness is validated under the [C++11 memory model](https:
 
 ### NaN Support
 
-The current implementation panics on `NaN` inputs to `Histogram::observe`, but it can be trivially supported by adding a `NaN` bucket after the `+Inf` bucket, ignored in collection results.
+`NaN` values are supported via a dedicated `NaN` bucket placed after `+Inf`, removed from the collection result.
 
 ## Discussion
 
-The Go implementation could be improved by using the `NaN` bucket trick presented above, and compute `_count` as the sum of non-`NaN` buckets. This eliminates the `_count` atomic, reducing observation to three atomic RMW — matching this algorithm.
+The Go implementation could be improved by computing `_count` as the sum of all buckets (and using the `NaN` bucket trick presented above). This eliminates the `_count` atomic, reducing observation to three atomic RMW — matching this algorithm.
 
 However, it lacks cache locality, which [benchmarks](benches/README.md) show has a significant impact under contention.
 
