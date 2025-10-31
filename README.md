@@ -1,8 +1,8 @@
-# histogram-3faa
+# split-histogram
 
 This repository is an experimental implementation of an optimized [Prometheus histogram](https://prometheus.io/docs/concepts/metric_types/#histogram). The algorithm achieves the following key properties:
 
-- **Lock-Free Critical Path**: Requires only **three** atomic fetch-and-add operations per observation.
+- **Lock-Free Critical Path**: Requires only **three** atomic RMW ([Read-Modify-Write](https://en.wikipedia.org/wiki/Read%E2%80%93modify%E2%80%93write))  operations per observation.
 - **Cache Locality**: Groups all atomic counters within the same cache line.
 
 ## Table of Contents
@@ -15,6 +15,7 @@ This repository is an experimental implementation of an optimized [Prometheus hi
   - [Cache Locality](#cache-locality)
   - [Testing](#testing)
   - [NaN Support](#nan-support)
+- [Discussion](#discussion)
 - [Disclaimer](#disclaimer)
 
 ## State of the Art
@@ -29,11 +30,11 @@ In contrast, early versions of the Go client and the unofficial Rust TiKV client
 <br>
 Histogram counters are duplicated across a “hot” and a “cold” shard. An observation counter, incremented before each observation, includes a bit flag to determine the hot shard. During collection, the bit flag is flipped to switch shards, and the previously hot shard’s `_count` is compared to the observation count before the flip in a loop. When these counts match, no further observations occur on the newly cold shard, enabling consistent collection.
 
-The current Go implementation, also adopted by the Rust TiKV client, represents the state of the art. It achieves lock-free observations with consistent collections. Since atomic [read-modify-write](https://en.wikipedia.org/wiki/Read%E2%80%93modify%E2%80%93write) operations, such as [fetch-and-add](https://en.wikipedia.org/wiki/Fetch-and-add), are relatively expensive, their count is a key indicator of efficiency in lock-free algorithms. Excluding retries for incrementing the float counter[^1], this approach requires **four** fetch-and-add operations.
+The current Go implementation, also adopted by the Rust TiKV client, represents the state of the art. It achieves lock-free observations with consistent collections. Since atomic RMW are relatively expensive, their count is a key indicator of efficiency in lock-free algorithms; Go implementation requires **four** atomic RMW[^1].
 
 It’s worth noting that both the Go and Rust TiKV implementations use spin loops for collection instead of waiting primitives — TiKV client doesn’t even use `std::hint::spin_loop`! Unbounded spin loops are [considered harmful](https://matklad.github.io/2020/01/02/spinlocks-considered-harmful.html), and `runtime.Gosched` introduces issues similar to those described for [`sched_yield` by Linus Torvalds](https://www.realworldtech.com/forum/?threadid=189711&curpostid=189752)[^2].
 
-In addition to using a proper waiting mechanism, the algorithm presented here requires only **three** fetch-and-add operations for observation, one fewer than the Go implementation.
+In addition to using a proper waiting mechanism, the algorithm presented here requires only **three** atomic RMW for observation, one fewer than the Go implementation.
 
 ## Algorithm
 
@@ -55,23 +56,21 @@ The algorithm stems from the question: Can the redundancy between the `_count` c
 
 ### Breaking the Reading Loop
 
-While the sequence ensures consistent reads, continuous observations may cause collection to loop indefinitely. The solution also uses sharding: observations occur on one shard, and collection switches to the second shard to read the first. A mutex prevents concurrent collections.
+While the sequence ensures consistent reads, continuous observations may cause collection to loop indefinitely. The solution also uses hot/cold sharding: observations occur on the hot shard, and collection switches shards. A mutex prevents concurrent collections.
 
-Unlike the Go client’s algorithm, this approach does not wait for all observations to complete on a shard; it ensures only reading consistency. Thus, resetting the read shard and merging its content into the other is not feasible. Instead, both shards are read separately, and their results are summed, splitting the histogram state across shards rather than replicating it.
-
-#### Observation Order Inversion Edge Case
-
-Since collection does not wait for all observations to complete on a shard before reading the second, an observation may complete on the first shard after its collection, while a subsequent observation is counted in the second shard’s collection. This edge case is acceptable for metrics, as the first observation will be included in the next collection.
+Unlike the Go client’s algorithm, this approach does not wait for all observations to complete on a shard; it ensures only reading consistency. Thus, resetting the read shard and merging its content into the other is not feasible. Instead, both shards are read separately, starting from the cold one, and their results are summed, splitting the histogram state across shards rather than replicating it.
 
 ### Avoiding Unbounded Spinning
 
 As noted in the [State of the Art](#state-of-the-art) section, unbounded spin loops are problematic. If a collection is blocked by an incomplete observation, the algorithm uses a proper waiting mechanism after a brief spin loop. The implementation employs `futures::task::AtomicWaker` with `futures::executor::block_on`, though alternatives like `Mutex<Thread>` with thread parking would work.
 
-To notify an observation that a collection is blocked, `_count` includes a “waiting flag” bit. After spinning unsuccessfully, collection registers a waker in `AtomicWaker`, sets the waiting flag while reading `_count` atomically, and attempts a new consistent read. If successful, the waker is unregistered, and the result is returned; otherwise, it waits for the waker to be called and repeats. On the observation side, incrementing `_count` with the waiting flag set triggers the registered waker.
+To notify an observation that a collection is blocked, `_count` includes a “waiting flag” bit. After spinning unsuccessfully, collection registers a waker in `AtomicWaker`, sets the waiting flag while reading `_count` atomically, and attempts a new consistent read. If successful, the waker is unregistered, and the result is returned; otherwise, it waits for the waker to be called and repeats.
+<br>
+On the observation side, incrementing `_count` with the waiting flag set triggers the registered waker. The additional cost is just three assembly instructions, one of which is a 100% predictable branch so completely negligible.
 
 ### Cache Locality
 
-Unlike the Go implementation, which increments a shared observation counter across shards, this algorithm performs all atomic increments within a single shard. Grouping a shard’s counters in the same cache line improves cache locality, beneficial for atomic [read-modify-write](https://en.wikipedia.org/wiki/Read%E2%80%93modify%E2%80%93write) operations that require [exclusive cache line access](https://en.wikipedia.org/wiki/MESI_protocol), as exclusivity acquisition is relatively costly.
+Unlike the Go implementation, which increments a shared observation counter across shards, this algorithm performs all atomic increments within a single shard. Grouping a shard’s counters in the same cache line improves cache locality, beneficial for atomic RMW that require [exclusive cache line access](https://en.wikipedia.org/wiki/MESI_protocol), as exclusivity acquisition is relatively costly.
 
 While not trivial in safe Rust, as `Vec` alignment cannot be modified, this is achieved using a two-dimensional array with the inner array aligned.
 
@@ -79,13 +78,23 @@ While not trivial in safe Rust, as `Vec` alignment cannot be modified, this is a
 
 The algorithm’s correctness is validated under the [C++11 memory model](https://en.cppreference.com/w/cpp/atomic/memory_order) using both [`miri`](https://github.com/rust-lang/miri) and [`loom`](https://github.com/tokio-rs/loom).
 
+[Benchmark results](benches/README.md) highlight both the impact of reducing the number of atomic RMW and cache locality.
+
 ### NaN Support
 
 The current implementation panics on `NaN` inputs to `Histogram::observe`, but it can be trivially supported by adding a `NaN` bucket after the `+Inf` bucket, ignored in collection results.
 
-## Disclaimer
+## Discussion
 
-This implementation was motivated by a project requiring millions of observations per second, where I needed to assess histogram latency impact. Reviewing the Rust Prometheus client source revealed a TODO linking to the Go client’s pull request. So I started to implement the Go algorithm into the Rust client, but I had the feeling doing it that there should be a way to use the redundancy between the bucket counters and the total counter. I have some experience in high-performance atomic algorithms, and the hot/cold shard algorithm is quite similar to the one I use in [`swap-buffer-queue`](https://github.com/wyfo/swap-buffer-queue). I was influenced by the sharding idea, but I managed to turn it differently by splitting the counters across shards instead of replicating them. Cache locality then came as an added benefit.
+The Go implementation could be improved by using the `NaN` bucket trick presented above, and compute `_count` as the sum of non-`NaN` buckets. This eliminates the `_count` atomic, reducing observation to three atomic RMW — matching this algorithm.
 
-[^1]: There is no atomic fetch-and-add operation defined for floats, so it’s implemented using a compare-and-swap loop with an integer atomic field to store the float bytes.
+However, it lacks cache locality, which [benchmarks](benches/README.md) show has a significant impact under contention.
+
+Additionally, avoiding unbounded spinning here relies on a flag in the `_count` atomic. Removing `_count` to save one atomic RMW prevents using the waiting flag, making proper waiting harder.
+
+## Context
+
+This implementation was motivated by a project requiring millions of observations per second, where I needed to assess histogram latency impact. Reviewing the Rust Prometheus client source revealed a TODO linking to the Go client’s pull request. So I started to implement the Go algorithm into the Rust client, but I had the feeling doing it that there should be a way to use the redundancy between the bucket counters and the total counter. I have some experience in high-performance atomic algorithms, and the hot/cold sharding algorithm is quite similar to the one I use in [`swap-buffer-queue`](https://github.com/wyfo/swap-buffer-queue). I was influenced by the sharding idea, but I managed to turn it differently by splitting the counters across shards instead of replicating them. Cache locality then came as an added benefit.
+
+[^1]: There is no atomic FAA (Fetch-and-Add) defined for floats, so it’s implemented using a CAS (Compare-and-Swap) loop with an integer atomic field to store the float bytes. For the sake of simplicity, CAS failures and retries are ignored in the rest of the document.
 [^2]: Although the Go scheduler differs from the Linux scheduler and goroutines are often more numerous than threads, Linus Torvalds’ arguments still apply. The `runtime.Gosched` function doesn’t seem to be designed for spin-lock mechanisms but rather for yielding in long-running, low-priority goroutines. A mechanism like this implementation’s, using a flag on the `_count` counter and a channel for notification, avoids these issues.
