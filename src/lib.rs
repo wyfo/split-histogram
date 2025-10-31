@@ -66,7 +66,7 @@ impl<T: HistogramValue> Histogram<T> {
         let shards = array::from_fn(|_| Shard::new(buckets.len()));
         Self(Arc::new(HistogramInner {
             buckets,
-            shard_index: AtomicU8::new(0),
+            hot_shard: AtomicU8::new(0),
             shards,
             collector: Mutex::new(()),
             waker: AtomicWaker::new(),
@@ -75,25 +75,25 @@ impl<T: HistogramValue> Histogram<T> {
 
     pub fn observe(&self, value: T) {
         let bucket_index = self.0.buckets.iter().position(|b| value <= *b).unwrap();
-        let shard_index = self.0.shard_index.load(Ordering::Relaxed) as usize;
-        self.0.shards[shard_index].observe(value, bucket_index, &self.0.waker);
+        let hot_shard = self.0.hot_shard.load(Ordering::Relaxed) as usize;
+        self.0.shards[hot_shard].observe(value, bucket_index, &self.0.waker);
     }
 
     pub fn collect(&self) -> (u64, T, Vec<(T, u64)>) {
         let _guard = self.0.collector.lock().unwrap();
-        self.0.shard_index.store(1, Ordering::Relaxed);
+        let hot_shard = self.0.hot_shard.load(Ordering::Relaxed) as usize;
+        let cold_shard = hot_shard ^ 1;
         let bucket_count = self.0.buckets.len();
-        let (count0, sum0, buckets0) = self.0.shards[0].collect(bucket_count, &self.0.waker);
-        self.0.shard_index.store(0, Ordering::Relaxed);
-        let (count1, sum1, buckets1) = self.0.shards[1].collect(bucket_count, &self.0.waker);
-        (
-            count0 + count1,
-            sum0 + sum1,
-            (self.0.buckets.iter())
-                .zip(iter::zip(buckets0, buckets1))
-                .map(|(b, (c0, c1))| (b.clone(), c0 + c1))
-                .collect(),
-        )
+        let (count_cold, sum_cold, buckets_cold) =
+            self.0.shards[cold_shard].collect(bucket_count, &self.0.waker);
+        self.0.hot_shard.store(cold_shard as u8, Ordering::Relaxed);
+        let (count_hot, sum_hot, buckets_hot) =
+            self.0.shards[hot_shard].collect(bucket_count, &self.0.waker);
+        let buckets = (self.0.buckets.iter())
+            .zip(iter::zip(buckets_cold, buckets_hot))
+            .map(|(b, (cold, hot))| (b.clone(), cold + hot))
+            .collect();
+        (count_cold + count_hot, sum_cold + sum_hot, buckets)
     }
 }
 
@@ -106,7 +106,7 @@ impl<T> Clone for Histogram<T> {
 #[derive(Debug)]
 struct HistogramInner<T> {
     buckets: Vec<T>,
-    shard_index: AtomicU8,
+    hot_shard: AtomicU8,
     shards: [Shard<T>; 2],
     collector: Mutex<()>,
     waker: AtomicWaker,
