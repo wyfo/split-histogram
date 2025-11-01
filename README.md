@@ -15,7 +15,7 @@ This repository is an experimental implementation of an optimized [Prometheus hi
   - [Testing](#testing)
   - [NaN Support](#nan-support)
 - [Discussion](#discussion)
-- [Disclaimer](#disclaimer)
+- [Context](#context)
 
 ## State of the Art
 
