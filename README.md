@@ -71,6 +71,8 @@ On the observation side, incrementing `_count` with the waiting flag set trigger
 
 Unlike the Go implementation, which increments a shared observation counter across shards, this algorithm performs all atomic increments within a single shard. Grouping a shard’s counters in the same cache line improves cache locality, beneficial for atomic RMW that require [exclusive cache line access](https://en.wikipedia.org/wiki/MESI_protocol), as exclusivity acquisition is relatively costly.
 
+Cache lines are typically 64B[^3], allowing the first **6 buckets** to fit in the same cache line as `_count` and `_sum`.
+
 While not trivial in safe Rust, as `Vec` alignment cannot be modified, this is achieved using a two-dimensional array with the inner array aligned.
 
 ### Testing
@@ -97,3 +99,4 @@ This implementation was motivated by a project requiring millions of observation
 
 [^1]: There is no atomic FAA (Fetch-and-Add) defined for floats, so it’s implemented using a CAS (Compare-and-Swap) loop with an integer atomic field to store the float bytes. For the sake of simplicity, CAS failures and retries are ignored in the rest of the document.
 [^2]: Although the Go scheduler differs from the Linux scheduler and goroutines are often more numerous than threads, Linus Torvalds’ arguments still apply. The `runtime.Gosched` function doesn’t seem to be designed for spin-lock mechanisms but rather for yielding in long-running, low-priority goroutines. A mechanism like this implementation’s, using a flag on the `_count` counter and a channel for notification, avoids these issues.
+[^3]: Modern ARM architectures use 128B cache lines, while Intel CPUs often handle 64B lines in pairs. For details, see [`crossbeam_utils::CachePadded` source](https://github.com/crossbeam-rs/crossbeam/blob/master/crossbeam-utils/src/cache_padded.rs#L63-L147).
