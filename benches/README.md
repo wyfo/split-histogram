@@ -111,16 +111,9 @@ comparison              fastest       │ slowest       │ median        │ me
 
 ## Analysis
 
-Results are **platform-dependent**:
+The additional atomic RMW in `go_observe` (the `_count` increment) has a measurable cost across all platforms, with the sole exception of Apple M3 in uncontended scenario.
 
-- The **additional atomic RMW** in `go_observe` has a **significant cost** on Ubuntu runners (x86-64 and aarch64), but is **negligible on Apple M3**.
-- **Cache locality** provides **consistent gains across all platforms**, reducing the impact of cache line invalidation from the contending thread.
+Cache locality, enabled by grouping all shard counters in a single cache line, delivers consistent performance improvements across all platforms, significantly reducing the impact of cache line invalidation triggered by the contending thread.
 
 [^1]: On a MacBook Air M3, one `std::hint::spin_loop` call takes ~8 ns.
 [^2]: GitHub Actions workflow run: https://github.com/wyfo/split-histogram/actions/runs/18954432694
-
-## Analysis
-
-The **additional atomic RMW** in `go_observe` (the `_count` increment) has a **measurable cost** across **all platforms**, with the sole exception of Apple M3 in uncontended scenario.
-
-**Cache locality**, enabled by grouping all shard counters in a single cache line, delivers **consistent performance improvements across all platforms**, significantly reducing the impact of cache line invalidation triggered by the contending thread.
