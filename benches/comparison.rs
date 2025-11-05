@@ -1,7 +1,6 @@
 use std::{
     array, hint,
     hint::black_box,
-    iter,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -28,15 +27,11 @@ struct GoShard {
 }
 
 impl GoHistogram {
-    fn new(buckets: impl IntoIterator<Item = f64>) -> Self {
-        let buckets = buckets
-            .into_iter()
-            .chain(iter::once(f64::INFINITY))
-            .collect::<Vec<_>>();
+    fn new(buckets: Vec<f64>) -> Self {
         let shards = array::from_fn(|_| GoShard {
             count: AtomicU64::new(0),
             sum: AtomicU64::new(0),
-            buckets: buckets.iter().map(|_| AtomicU64::new(0)).collect(),
+            buckets: (0..buckets.len() + 1).map(|_| AtomicU64::new(0)).collect(),
         });
         Self(Arc::new(GoHistogramInner {
             buckets,
@@ -46,7 +41,9 @@ impl GoHistogram {
     }
 
     fn observe<const COUNT: bool>(&self, value: f64) {
-        let bucket_idx = self.0.buckets.iter().position(|b| value <= *b).unwrap();
+        let bucket_idx = (self.0.buckets.iter())
+            .position(|b| value <= *b)
+            .unwrap_or(self.0.buckets.len());
         let shard_idx = self.0.shard_idx_and_count.fetch_add(2, Ordering::Relaxed) & 1;
         let shard = &self.0.shards[shard_idx as usize];
         f64::atomic_add(&shard.sum, value, Ordering::Relaxed);
