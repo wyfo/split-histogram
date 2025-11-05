@@ -3,13 +3,19 @@ name = "histogram"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["prometheus-client"]
+prometheus-client = ["dep:prometheus-client"]
+
 [dependencies]
 crossbeam-utils = "0.8"
 futures-executor = "0.3"
 futures-util = "0.3"
+prometheus-client = { version = "0.24", optional = true }
 
 [dev-dependencies]
 divan = "0.1"
+itertools = "0.14"
 
 [target."cfg(loom)".dependencies]
 loom = { version = "0.7", features = ["futures"] }

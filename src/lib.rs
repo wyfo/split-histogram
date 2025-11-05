@@ -2,6 +2,7 @@
 use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 use std::{
     array,
+    fmt::Error,
     future::poll_fn,
     iter,
     marker::PhantomData,
@@ -21,6 +22,10 @@ use loom::{
     future::{block_on, AtomicWaker},
     sync::atomic::{AtomicU64, AtomicU8, Ordering},
 };
+use prometheus_client::{
+    encoding::{EncodeMetric, MetricEncoder, NoLabelSet},
+    metrics::{MetricType, TypedMetric},
+};
 
 pub trait HistogramValue: Add<Output = Self> + PartialOrd + Sized {
     const HAS_NAN: bool;
@@ -38,11 +43,11 @@ impl HistogramValue for u64 {
     fn is_nan(&self) -> bool {
         false
     }
-    fn from_bits(bits: u64) -> Self {
-        bits
-    }
     fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering) {
         counter.fetch_add(value, ordering);
+    }
+    fn from_bits(bits: u64) -> Self {
+        bits
     }
 }
 
@@ -54,9 +59,6 @@ impl HistogramValue for f64 {
     fn is_nan(&self) -> bool {
         f64::is_nan(*self)
     }
-    fn from_bits(bits: u64) -> Self {
-        f64::from_bits(bits)
-    }
     fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering) {
         counter
             .fetch_update(ordering, Ordering::Relaxed, |c| {
@@ -64,13 +66,16 @@ impl HistogramValue for f64 {
             })
             .unwrap();
     }
+    fn from_bits(bits: u64) -> Self {
+        f64::from_bits(bits)
+    }
 }
 
 #[expect(clippy::len_without_is_empty)]
 pub trait HistogramBuckets<T> {
     fn len(&self) -> usize;
     fn bucket_index(&self, value: &T) -> Option<usize>;
-    fn iter(&self) -> impl Iterator<Item = f64> + '_;
+    fn iter(&self) -> impl Iterator<Item = f64>;
 }
 
 impl<T: HistogramValue + Clone + 'static, B: AsRef<[T]>> HistogramBuckets<T> for B {
@@ -82,7 +87,7 @@ impl<T: HistogramValue + Clone + 'static, B: AsRef<[T]>> HistogramBuckets<T> for
         self.as_ref().iter().position(|b| value <= b)
     }
 
-    fn iter(&self) -> impl Iterator<Item = f64> + '_ {
+    fn iter(&self) -> impl Iterator<Item = f64> {
         self.as_ref().iter().cloned().map(T::into_f64)
     }
 }
@@ -114,7 +119,7 @@ impl<T: HistogramValue, B: HistogramBuckets<T>> Histogram<T, B> {
         self.0.shards[hot_shard].observe(value, bucket_index, &self.0.waker);
     }
 
-    pub fn collect(&self) -> (u64, f64, Vec<(f64, u64)>) {
+    pub fn collect(&self) -> (u64, f64, impl Iterator<Item = (f64, u64)>) {
         let _guard = self.0.collector.lock().unwrap();
         let hot_shard = self.0.hot_shard.load(Ordering::Relaxed) as usize;
         let cold_shard = hot_shard ^ 1;
@@ -126,8 +131,7 @@ impl<T: HistogramValue, B: HistogramBuckets<T>> Histogram<T, B> {
             self.0.shards[hot_shard].collect(bucket_count, &self.0.waker);
         let buckets = (self.0.buckets.iter().chain([f64::INFINITY]))
             .zip(iter::zip(buckets_cold, buckets_hot))
-            .map(|(b, (cold, hot))| (b, cold + hot))
-            .collect();
+            .map(|(b, (cold, hot))| (b, cold + hot));
         (count_cold + count_hot, sum_cold + sum_hot, buckets)
     }
 }
@@ -256,11 +260,27 @@ impl<T: HistogramValue> Shard<T> {
     }
 }
 
+impl<T, B> TypedMetric for Histogram<T, B> {
+    const TYPE: MetricType = MetricType::Histogram;
+}
+
+impl<T: HistogramValue, B: HistogramBuckets<T>> EncodeMetric for Histogram<T, B> {
+    fn encode(&self, mut encoder: MetricEncoder) -> Result<(), Error> {
+        let (count, sum, buckets) = self.collect();
+        encoder.encode_histogram::<NoLabelSet>(sum, count, &buckets.collect::<Vec<_>>(), None)
+    }
+
+    fn metric_type(&self) -> MetricType {
+        Self::TYPE
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(not(loom))]
     use std::thread;
 
+    use itertools::Itertools;
     #[cfg(loom)]
     use loom::{model, thread};
 
@@ -278,7 +298,10 @@ mod tests {
             let h1 = histogram.clone();
             let h2 = histogram.clone();
             let t1 = thread::spawn(move || h1.observe(42));
-            let t2 = thread::spawn(move || h2.collect());
+            let t2 = thread::spawn(move || {
+                let (count, sum, buckets) = h2.collect();
+                (count, sum, buckets.collect_vec())
+            });
             histogram.observe(7);
             histogram.observe(80100);
             t1.join().unwrap();
@@ -296,7 +319,10 @@ mod tests {
             let (count, sum, buckets) = histogram.collect();
             assert_eq!(count, 3);
             assert_eq!(sum, 80149.0);
-            assert_eq!(buckets, vec![(10.0, 1), (100.0, 1), (f64::INFINITY, 1)]);
+            assert_eq!(
+                buckets.collect_vec(),
+                vec![(10.0, 1), (100.0, 1), (f64::INFINITY, 1)]
+            );
         });
     }
 
@@ -330,10 +356,11 @@ mod tests {
     fn observe_inf() {
         let histogram = Histogram::new([1.0]);
         histogram.observe(f64::INFINITY);
-        assert_eq!(
-            histogram.collect(),
-            (1, f64::INFINITY, vec![(1.0, 0), (f64::INFINITY, 1)])
-        );
+        histogram.observe(1.0);
+        let (count, sum, buckets) = histogram.collect();
+        assert_eq!(count, 1);
+        assert_eq!(sum, f64::INFINITY);
+        assert_eq!(buckets.collect_vec(), vec![(1.0, 1), (f64::INFINITY, 1)]);
     }
 
     #[cfg(not(loom))]
@@ -344,6 +371,6 @@ mod tests {
         let (count, sum, buckets) = histogram.collect();
         assert_eq!(count, 1);
         assert!(sum.is_nan());
-        assert_eq!(buckets, vec![(1.0, 0), (f64::INFINITY, 0)]);
+        assert_eq!(buckets.collect_vec(), vec![(1.0, 0), (f64::INFINITY, 0)]);
     }
 }
