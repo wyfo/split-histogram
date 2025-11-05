@@ -22,29 +22,41 @@ use loom::{
     sync::atomic::{AtomicU64, AtomicU8, Ordering},
 };
 
-pub trait HistogramValue: Clone + Add<Output = Self> + PartialOrd + Sized {
-    const MAX: Self;
-    fn from_bits(bits: u64) -> Self;
+pub trait HistogramValue: Add<Output = Self> + PartialOrd + Sized {
+    const HAS_NAN: bool;
+    fn into_f64(self) -> f64;
+    fn is_nan(&self) -> bool;
     fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering);
+    fn from_bits(bits: u64) -> Self;
 }
 
 impl HistogramValue for u64 {
-    const MAX: Self = u64::MAX;
+    const HAS_NAN: bool = false;
+    fn into_f64(self) -> f64 {
+        self as f64
+    }
+    fn is_nan(&self) -> bool {
+        false
+    }
     fn from_bits(bits: u64) -> Self {
         bits
     }
-
     fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering) {
         counter.fetch_add(value, ordering);
     }
 }
 
 impl HistogramValue for f64 {
-    const MAX: Self = f64::INFINITY;
+    const HAS_NAN: bool = true;
+    fn into_f64(self) -> f64 {
+        self
+    }
+    fn is_nan(&self) -> bool {
+        f64::is_nan(*self)
+    }
     fn from_bits(bits: u64) -> Self {
         f64::from_bits(bits)
     }
-
     fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering) {
         counter
             .fetch_update(ordering, Ordering::Relaxed, |c| {
@@ -54,16 +66,37 @@ impl HistogramValue for f64 {
     }
 }
 
-#[derive(Debug)]
-pub struct Histogram<T = f64>(Arc<HistogramInner<T>>);
+#[expect(clippy::len_without_is_empty)]
+pub trait HistogramBuckets<T> {
+    fn len(&self) -> usize;
+    fn bucket_index(&self, value: &T) -> Option<usize>;
+    fn iter(&self) -> impl Iterator<Item = f64> + '_;
+}
 
-impl<T: HistogramValue> Histogram<T> {
-    pub fn new(buckets: impl IntoIterator<Item = T>) -> Self {
-        let buckets = buckets
-            .into_iter()
-            .chain(iter::once(T::MAX))
-            .collect::<Vec<_>>();
-        let shards = array::from_fn(|_| Shard::new(buckets.len()));
+impl<T: HistogramValue + Clone + 'static, B: AsRef<[T]>> HistogramBuckets<T> for B {
+    fn len(&self) -> usize {
+        self.as_ref().len()
+    }
+
+    fn bucket_index(&self, value: &T) -> Option<usize> {
+        self.as_ref().iter().position(|b| value <= b)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = f64> + '_ {
+        self.as_ref().iter().cloned().map(T::into_f64)
+    }
+}
+
+#[derive(Debug)]
+pub struct Histogram<T = f64, B = Vec<T>>(Arc<HistogramInner<T, B>>);
+
+impl<T: HistogramValue, B: HistogramBuckets<T>> Histogram<T, B> {
+    fn bucket_count(buckets: &B) -> usize {
+        buckets.len() + /* inf */ 1 + /* nan */ if T::HAS_NAN { 1 } else { 0 }
+    }
+
+    pub fn new(buckets: B) -> Self {
+        let shards = array::from_fn(|_| Shard::new(Self::bucket_count(&buckets)));
         Self(Arc::new(HistogramInner {
             buckets,
             hot_shard: AtomicU8::new(0),
@@ -74,38 +107,40 @@ impl<T: HistogramValue> Histogram<T> {
     }
 
     pub fn observe(&self, value: T) {
-        let bucket_index = self.0.buckets.iter().position(|b| value <= *b);
+        let buckets = &self.0.buckets;
+        let fallback_bucket = || buckets.len() + if value.is_nan() { 1 } else { 0 };
+        let bucket_index = buckets.bucket_index(&value).unwrap_or_else(fallback_bucket);
         let hot_shard = self.0.hot_shard.load(Ordering::Relaxed) as usize;
-        self.0.shards[hot_shard].observe(value, bucket_index, self.0.buckets.len(), &self.0.waker);
+        self.0.shards[hot_shard].observe(value, bucket_index, &self.0.waker);
     }
 
-    pub fn collect(&self) -> (u64, T, Vec<(T, u64)>) {
+    pub fn collect(&self) -> (u64, f64, Vec<(f64, u64)>) {
         let _guard = self.0.collector.lock().unwrap();
         let hot_shard = self.0.hot_shard.load(Ordering::Relaxed) as usize;
         let cold_shard = hot_shard ^ 1;
-        let bucket_count = self.0.buckets.len();
+        let bucket_count = Self::bucket_count(&self.0.buckets);
         let (count_cold, sum_cold, buckets_cold) =
             self.0.shards[cold_shard].collect(bucket_count, &self.0.waker);
         self.0.hot_shard.store(cold_shard as u8, Ordering::Relaxed);
         let (count_hot, sum_hot, buckets_hot) =
             self.0.shards[hot_shard].collect(bucket_count, &self.0.waker);
-        let buckets = (self.0.buckets.iter())
+        let buckets = (self.0.buckets.iter().chain([f64::INFINITY]))
             .zip(iter::zip(buckets_cold, buckets_hot))
-            .map(|(b, (cold, hot))| (b.clone(), cold + hot))
+            .map(|(b, (cold, hot))| (b, cold + hot))
             .collect();
         (count_cold + count_hot, sum_cold + sum_hot, buckets)
     }
 }
 
-impl<T> Clone for Histogram<T> {
+impl<T, B> Clone for Histogram<T, B> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
 #[derive(Debug)]
-struct HistogramInner<T> {
-    buckets: Vec<T>,
+struct HistogramInner<T, B> {
+    buckets: B,
     hot_shard: AtomicU8,
     shards: [Shard<T>; 2],
     collector: Mutex<()>,
@@ -134,8 +169,7 @@ struct Shard<T> {
 impl<T: HistogramValue> Shard<T> {
     fn new(bucket_count: usize) -> Self {
         Self {
-            // `+ 3` for _count, _sum and `NaN` bucket
-            counters: (0..(bucket_count + 3).div_ceil(COUNTERS_PER_CACHE_LINE))
+            counters: (0..(/* _count + _sum */2 + bucket_count).div_ceil(COUNTERS_PER_CACHE_LINE))
                 .map(|_| CachePadded::new(array::from_fn(|_| AtomicU64::new(0))))
                 .collect(),
             _phantom: PhantomData,
@@ -163,15 +197,8 @@ impl<T: HistogramValue> Shard<T> {
             .take(bucket_count)
     }
 
-    fn observe(
-        &self,
-        value: T,
-        bucket_index: Option<usize>,
-        bucket_count: usize,
-        waker: &AtomicWaker,
-    ) {
-        self.bucket(bucket_index.unwrap_or(bucket_count))
-            .fetch_add(1, Ordering::Relaxed);
+    fn observe(&self, value: T, bucket_index: usize, waker: &AtomicWaker) {
+        self.bucket(bucket_index).fetch_add(1, Ordering::Relaxed);
         T::atomic_add(self.sum(), value, Ordering::Release);
         let count = self.count().fetch_add(1, Ordering::Release);
         if count & WAITING_FLAG != 0 {
@@ -183,19 +210,18 @@ impl<T: HistogramValue> Shard<T> {
         }
     }
 
-    fn read_sum_and_buckets(&self, buckets: &mut [u64]) -> (T, u64) {
+    fn read_sum_and_buckets(&self, buckets: &mut [u64]) -> (f64, u64) {
         let bucket_count = buckets.len();
-        let sum = T::from_bits(self.sum().load(Ordering::Acquire));
+        let sum = T::from_bits(self.sum().load(Ordering::Acquire)).into_f64();
         let mut expected_count = 0;
         for (count, counter) in buckets.iter_mut().zip(self.buckets(bucket_count)) {
             *count = counter.load(Ordering::Relaxed);
             expected_count += *count;
         }
-        expected_count += self.bucket(bucket_count).load(Ordering::Relaxed);
         (sum, expected_count)
     }
 
-    fn collect(&self, bucket_count: usize, waker: &AtomicWaker) -> (u64, T, Vec<u64>) {
+    fn collect(&self, bucket_count: usize, waker: &AtomicWaker) -> (u64, f64, Vec<u64>) {
         let mut buckets = vec![0; bucket_count];
         for _ in 0..SPIN_LOOP_LIMIT {
             let count = self.count().load(Ordering::Acquire) & COUNT_MASK;
@@ -208,7 +234,7 @@ impl<T: HistogramValue> Shard<T> {
     }
 
     #[cold]
-    fn collect_cold(&self, buckets: &mut Vec<u64>, waker: &AtomicWaker) -> (u64, T, Vec<u64>) {
+    fn collect_cold(&self, buckets: &mut Vec<u64>, waker: &AtomicWaker) -> (u64, f64, Vec<u64>) {
         block_on(poll_fn(move |cx| {
             #[cfg(not(loom))]
             waker.register(cx.waker());
@@ -258,19 +284,19 @@ mod tests {
             t1.join().unwrap();
             let (count, sum, buckets) = t2.join().unwrap();
             assert!(count <= 3);
-            let [(10, b0), (100, b1), (u64::MAX, b2)] = buckets[..] else {
+            let [(10.0, b0), (100.0, b1), (f64::INFINITY, b2)] = buckets[..] else {
                 unreachable!()
             };
             assert_eq!(count, b0 + b1 + b2);
-            let if_bucket = |b, v| if b == 1 { v } else { 0 };
+            let if_bucket = |b, v| if b == 1 { v } else { 0.0 };
             assert_eq!(
                 sum,
-                if_bucket(b0, 7) + if_bucket(b1, 42) + if_bucket(b2, 80100)
+                if_bucket(b0, 7.0) + if_bucket(b1, 42.0) + if_bucket(b2, 80100.0)
             );
             let (count, sum, buckets) = histogram.collect();
             assert_eq!(count, 3);
-            assert_eq!(sum, 80149);
-            assert_eq!(buckets, vec![(10, 1), (100, 1), (u64::MAX, 1)]);
+            assert_eq!(sum, 80149.0);
+            assert_eq!(buckets, vec![(10.0, 1), (100.0, 1), (f64::INFINITY, 1)]);
         });
     }
 
@@ -289,12 +315,12 @@ mod tests {
             let (_, sum1, _) = histogram.collect();
             let (_, sum2, _) = histogram.collect();
             edge_case2.fetch_or(
-                sum1 == 0 && sum2 == 42,
+                sum1 == 0.0 && sum2 == 42.0,
                 std::sync::atomic::Ordering::Relaxed,
             );
             t1.join().unwrap();
             let (_, sum, _) = histogram.collect();
-            assert_eq!(sum, 49);
+            assert_eq!(sum, 49.0);
         });
         assert!(edge_case.load(std::sync::atomic::Ordering::Relaxed));
     }
