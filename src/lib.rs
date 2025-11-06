@@ -27,7 +27,7 @@ use prometheus_client::{
     metrics::{MetricType, TypedMetric},
 };
 
-pub trait HistogramValue: Add<Output = Self> + PartialOrd + Sized {
+pub trait HistogramValue: Sized {
     const HAS_NAN: bool;
     fn into_f64(self) -> f64;
     fn is_nan(&self) -> bool;
@@ -78,7 +78,7 @@ pub trait HistogramBuckets<T> {
     fn iter(&self) -> impl Iterator<Item = f64>;
 }
 
-impl<T: HistogramValue + Clone + 'static, B: AsRef<[T]>> HistogramBuckets<T> for B {
+impl<T: HistogramValue + PartialOrd + Clone + 'static, B: AsRef<[T]>> HistogramBuckets<T> for B {
     fn len(&self) -> usize {
         self.as_ref().len()
     }
