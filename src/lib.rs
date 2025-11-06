@@ -1,5 +1,5 @@
 #[cfg(not(loom))]
-use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{
     array,
     fmt::Error,
@@ -20,7 +20,7 @@ use futures_util::task::AtomicWaker;
 #[cfg(loom)]
 use loom::{
     future::{block_on, AtomicWaker},
-    sync::atomic::{AtomicU64, AtomicU8, Ordering},
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
 use prometheus_client::{
     encoding::{EncodeMetric, MetricEncoder, NoLabelSet},
@@ -104,7 +104,7 @@ impl<T: HistogramValue, B: HistogramBuckets<T>> Histogram<T, B> {
         let shards = array::from_fn(|_| Shard::new(Self::bucket_count(&buckets)));
         Self(Arc::new(HistogramInner {
             buckets,
-            hot_shard: AtomicU8::new(0),
+            hot_shard: AtomicUsize::new(0),
             shards,
             collector: Mutex::new(()),
             waker: AtomicWaker::new(),
@@ -115,18 +115,18 @@ impl<T: HistogramValue, B: HistogramBuckets<T>> Histogram<T, B> {
         let buckets = &self.0.buckets;
         let fallback_bucket = || buckets.len() + if value.is_nan() { 1 } else { 0 };
         let bucket_index = buckets.bucket_index(&value).unwrap_or_else(fallback_bucket);
-        let hot_shard = self.0.hot_shard.load(Ordering::Relaxed) as usize;
+        let hot_shard = self.0.hot_shard.load(Ordering::Relaxed);
         self.0.shards[hot_shard].observe(value, bucket_index, &self.0.waker);
     }
 
     pub fn collect(&self) -> (u64, f64, impl Iterator<Item = (f64, u64)>) {
         let _guard = self.0.collector.lock().unwrap();
-        let hot_shard = self.0.hot_shard.load(Ordering::Relaxed) as usize;
+        let hot_shard = self.0.hot_shard.load(Ordering::Relaxed);
         let cold_shard = hot_shard ^ 1;
         let bucket_count = Self::bucket_count(&self.0.buckets);
         let (count_cold, sum_cold, buckets_cold) =
             self.0.shards[cold_shard].collect(bucket_count, &self.0.waker);
-        self.0.hot_shard.store(cold_shard as u8, Ordering::Relaxed);
+        self.0.hot_shard.store(cold_shard, Ordering::Relaxed);
         let (count_hot, sum_hot, buckets_hot) =
             self.0.shards[hot_shard].collect(bucket_count, &self.0.waker);
         let buckets = (self.0.buckets.iter().chain([f64::INFINITY]))
@@ -145,7 +145,7 @@ impl<T, B> Clone for Histogram<T, B> {
 #[derive(Debug)]
 struct HistogramInner<T, B> {
     buckets: B,
-    hot_shard: AtomicU8,
+    hot_shard: AtomicUsize,
     shards: [Shard<T>; 2],
     collector: Mutex<()>,
     waker: AtomicWaker,
