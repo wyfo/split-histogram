@@ -1,3 +1,5 @@
+#![cfg_attr(not(any(feature = "unsafe", feature = "asm")), forbid(unsafe_code))]
+
 #[cfg(not(loom))]
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::{
@@ -7,12 +9,10 @@ use std::{
     iter,
     marker::PhantomData,
     mem,
-    ops::Add,
     sync::{Arc, Mutex},
     task::Poll,
 };
 
-use crossbeam_utils::CachePadded;
 #[cfg(not(loom))]
 use futures_executor::block_on;
 #[cfg(not(loom))]
@@ -22,12 +22,17 @@ use loom::{
     future::{block_on, AtomicWaker},
     sync::atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+#[cfg(feature = "prometheus-client")]
 use prometheus_client::{
     encoding::{EncodeMetric, MetricEncoder, NoLabelSet},
     metrics::{MetricType, TypedMetric},
 };
 
-pub trait HistogramValue: Sized {
+mod impls;
+#[cfg(test)]
+mod tests;
+
+pub trait HistogramValue {
     const HAS_NAN: bool;
     fn into_f64(self) -> f64;
     fn is_nan(&self) -> bool;
@@ -35,87 +40,61 @@ pub trait HistogramValue: Sized {
     fn from_bits(bits: u64) -> Self;
 }
 
-impl HistogramValue for u64 {
-    const HAS_NAN: bool = false;
-    fn into_f64(self) -> f64 {
-        self as f64
-    }
-    fn is_nan(&self) -> bool {
-        false
-    }
-    fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering) {
-        counter.fetch_add(value, ordering);
-    }
-    fn from_bits(bits: u64) -> Self {
-        bits
-    }
-}
-
-impl HistogramValue for f64 {
-    const HAS_NAN: bool = true;
-    fn into_f64(self) -> f64 {
-        self
-    }
-    fn is_nan(&self) -> bool {
-        f64::is_nan(*self)
-    }
-    fn atomic_add(counter: &AtomicU64, value: Self, ordering: Ordering) {
-        counter
-            .fetch_update(ordering, Ordering::Relaxed, |c| {
-                Some(f64::to_bits(f64::from_bits(c) + value))
-            })
-            .unwrap();
-    }
-    fn from_bits(bits: u64) -> Self {
-        f64::from_bits(bits)
-    }
-}
-
 #[expect(clippy::len_without_is_empty)]
-pub trait HistogramBuckets<T> {
-    fn len(&self) -> usize;
-    fn bucket_index(&self, value: &T) -> Option<usize>;
-    fn iter(&self) -> impl Iterator<Item = f64>;
+pub trait HistogramBuckets {
+    type Value: HistogramValue;
+    fn bucket_index(&self, value: &Self::Value) -> Option<usize>;
+    fn values(&self) -> impl Iterator<Item = Self::Value>;
 }
-
-impl<T: HistogramValue + PartialOrd + Clone + 'static, B: AsRef<[T]>> HistogramBuckets<T> for B {
-    fn len(&self) -> usize {
-        self.as_ref().len()
-    }
-
-    fn bucket_index(&self, value: &T) -> Option<usize> {
-        self.as_ref().iter().position(|b| value <= b)
-    }
-
-    fn iter(&self) -> impl Iterator<Item = f64> {
-        self.as_ref().iter().cloned().map(T::into_f64)
-    }
-}
+#[cfg(feature = "unsafe")]
+/// # Safety
+///
+/// [`HistogramBuckets::bucket_index`] must return an index lesser than
+/// the count of items returned by [`HistogramBuckets::values`]
+pub unsafe trait TrustedHistogramBuckets: HistogramBuckets {}
 
 #[derive(Debug)]
-pub struct Histogram<T = f64, B = Vec<T>>(Arc<HistogramInner<T, B>>);
+pub struct Histogram<B: HistogramBuckets = Vec<f64>, const TRUSTED_BUCKETS: bool = false>(
+    Arc<HistogramInner<B>>,
+);
 
-impl<T: HistogramValue, B: HistogramBuckets<T>> Histogram<T, B> {
-    fn bucket_count(buckets: &B) -> usize {
-        buckets.len() + /* inf */ 1 + /* nan */ if T::HAS_NAN { 1 } else { 0 }
-    }
-
+impl<B: HistogramBuckets> Histogram<B> {
     pub fn new(buckets: B) -> Self {
-        let shards = array::from_fn(|_| Shard::new(Self::bucket_count(&buckets)));
+        let bucket_count =
+            buckets.values().count() + /* inf */ 1 + /* nan */ B::Value::HAS_NAN as usize;
         Self(Arc::new(HistogramInner {
             buckets,
+            bucket_count,
             hot_shard: AtomicUsize::new(0),
-            shards,
+            shards: array::from_fn(|_| Shard::new(bucket_count)),
             collector: Mutex::new(()),
             waker: AtomicWaker::new(),
         }))
     }
+}
 
-    pub fn observe(&self, value: T) {
+#[cfg(feature = "unsafe")]
+impl<B: TrustedHistogramBuckets> Histogram<B, true> {
+    pub fn new_trusted(buckets: B) -> Self {
+        Self(Histogram::new(buckets).0)
+    }
+}
+
+impl<B: HistogramBuckets, const TRUSTED_BUCKETS: bool> Histogram<B, TRUSTED_BUCKETS> {
+    pub fn observe(&self, value: B::Value) {
         let buckets = &self.0.buckets;
-        let fallback_bucket = || buckets.len() + if value.is_nan() { 1 } else { 0 };
+        let fallback_bucket =
+            || self.0.bucket_count - 1 - (B::Value::HAS_NAN && !value.is_nan()) as usize;
         let bucket_index = buckets.bucket_index(&value).unwrap_or_else(fallback_bucket);
+        #[cfg(feature = "unsafe")]
+        if !TRUSTED_BUCKETS {
+            assert!(bucket_index < self.0.bucket_count);
+        }
         let hot_shard = self.0.hot_shard.load(Ordering::Relaxed);
+        #[cfg(feature = "unsafe")]
+        if hot_shard > 1 {
+            unsafe { std::hint::unreachable_unchecked() }
+        }
         self.0.shards[hot_shard].observe(value, bucket_index, &self.0.waker);
     }
 
@@ -123,89 +102,80 @@ impl<T: HistogramValue, B: HistogramBuckets<T>> Histogram<T, B> {
         let _guard = self.0.collector.lock().unwrap();
         let hot_shard = self.0.hot_shard.load(Ordering::Relaxed);
         let cold_shard = hot_shard ^ 1;
-        let bucket_count = Self::bucket_count(&self.0.buckets);
         let (count_cold, sum_cold, buckets_cold) =
-            self.0.shards[cold_shard].collect(bucket_count, &self.0.waker);
+            self.0.shards[cold_shard].collect(self.0.bucket_count, &self.0.waker);
         self.0.hot_shard.store(cold_shard, Ordering::Relaxed);
         let (count_hot, sum_hot, buckets_hot) =
-            self.0.shards[hot_shard].collect(bucket_count, &self.0.waker);
-        let buckets = (self.0.buckets.iter().chain([f64::INFINITY]))
+            self.0.shards[hot_shard].collect(self.0.bucket_count, &self.0.waker);
+        let buckets = (self.0.buckets.values().map(B::Value::into_f64))
+            .chain([f64::INFINITY])
             .zip(iter::zip(buckets_cold, buckets_hot))
             .map(|(b, (cold, hot))| (b, cold + hot));
         (count_cold + count_hot, sum_cold + sum_hot, buckets)
     }
 }
 
-impl<T, B> Clone for Histogram<T, B> {
+impl<B: HistogramBuckets, const TRUSTED_BUCKET: bool> Clone for Histogram<B, TRUSTED_BUCKET> {
     fn clone(&self) -> Self {
         Self(self.0.clone())
     }
 }
 
 #[derive(Debug)]
-struct HistogramInner<T, B> {
+struct HistogramInner<B: HistogramBuckets> {
     buckets: B,
+    bucket_count: usize,
     hot_shard: AtomicUsize,
-    shards: [Shard<T>; 2],
+    shards: [Shard<B>; 2],
     collector: Mutex<()>,
     waker: AtomicWaker,
 }
 
-const COUNTERS_PER_CACHE_LINE: usize = align_of::<CachePadded<()>>() / align_of::<AtomicU64>();
-#[cfg(not(loom))]
-const SPIN_LOOP_LIMIT: usize = 10;
-#[cfg(loom)]
-const SPIN_LOOP_LIMIT: usize = 1;
-const WAITING_FLAG: u64 = 1 << (u64::BITS - 1);
-const COUNT_MASK: u64 = !WAITING_FLAG;
-
-#[derive(Debug)]
-struct Shard<T> {
-    // all counters should be stored on the same cache line to optimize grouped atomic operations
-    // they are stored in the following order:
-    // - _count
-    // - _sum
-    // - _buckets
-    counters: Vec<CachePadded<[AtomicU64; COUNTERS_PER_CACHE_LINE]>>,
-    _phantom: PhantomData<T>,
+#[cfg(feature = "unsafe")]
+impl<B: HistogramBuckets> Drop for HistogramInner<B> {
+    fn drop(&mut self) {
+        for shard in &mut self.shards {
+            shard.drop(self.bucket_count);
+        }
+    }
 }
 
-impl<T: HistogramValue> Shard<T> {
+trait HistogramCounters {
+    fn new(bucket_count: usize) -> Self;
+    fn count(&self) -> &AtomicU64;
+    fn sum(&self) -> &AtomicU64;
+    fn bucket(&self, bucket_index: usize) -> &AtomicU64;
+    fn buckets(&self, bucket_count: usize) -> impl Iterator<Item = &AtomicU64>;
+    #[cfg(feature = "unsafe")]
+    fn drop(&mut self, bucket_count: usize) {
+        let _ = bucket_count;
+    }
+}
+
+#[derive(Debug)]
+struct Shard<B> {
+    counters: impls::Counters,
+    _phantom: PhantomData<B>,
+}
+
+impl<B: HistogramBuckets> Shard<B> {
+    const SPIN_LOOP_LIMIT: usize = if cfg!(not(loom)) { 10 } else { 1 };
+    const WAITING_FLAG: u64 = 1 << (u64::BITS - 1);
+
     fn new(bucket_count: usize) -> Self {
         Self {
-            counters: (0..(/* _count + _sum */2 + bucket_count).div_ceil(COUNTERS_PER_CACHE_LINE))
-                .map(|_| CachePadded::new(array::from_fn(|_| AtomicU64::new(0))))
-                .collect(),
+            counters: HistogramCounters::new(bucket_count),
             _phantom: PhantomData,
         }
     }
 
-    fn count(&self) -> &AtomicU64 {
-        &self.counters[0][0]
-    }
-
-    fn sum(&self) -> &AtomicU64 {
-        &self.counters[0][1]
-    }
-
-    fn bucket(&self, bucket_index: usize) -> &AtomicU64 {
-        let idx = bucket_index + 2;
-        &self.counters[idx / COUNTERS_PER_CACHE_LINE][idx % COUNTERS_PER_CACHE_LINE]
-    }
-
-    fn buckets(&self, bucket_count: usize) -> impl IntoIterator<Item = &AtomicU64> {
+    fn observe(&self, value: B::Value, bucket_index: usize, waker: &AtomicWaker) {
         self.counters
-            .iter()
-            .flat_map(|cache_line| cache_line.iter())
-            .skip(2)
-            .take(bucket_count)
-    }
-
-    fn observe(&self, value: T, bucket_index: usize, waker: &AtomicWaker) {
-        self.bucket(bucket_index).fetch_add(1, Ordering::Relaxed);
-        T::atomic_add(self.sum(), value, Ordering::Release);
-        let count = self.count().fetch_add(1, Ordering::Release);
-        if count & WAITING_FLAG != 0 {
+            .bucket(bucket_index)
+            .fetch_add(1, Ordering::Relaxed);
+        B::Value::atomic_add(self.counters.sum(), value, Ordering::Release);
+        let count = self.counters.count().fetch_add(1, Ordering::Release);
+        if count & Self::WAITING_FLAG != 0 {
             #[cold]
             fn wake(waker: &AtomicWaker) {
                 waker.wake();
@@ -216,9 +186,9 @@ impl<T: HistogramValue> Shard<T> {
 
     fn read_sum_and_buckets(&self, buckets: &mut [u64]) -> (f64, u64) {
         let bucket_count = buckets.len();
-        let sum = T::from_bits(self.sum().load(Ordering::Acquire)).into_f64();
+        let sum = B::Value::from_bits(self.counters.sum().load(Ordering::Acquire)).into_f64();
         let mut expected_count = 0;
-        for (count, counter) in buckets.iter_mut().zip(self.buckets(bucket_count)) {
+        for (count, counter) in buckets.iter_mut().zip(self.counters.buckets(bucket_count)) {
             *count = counter.load(Ordering::Relaxed);
             expected_count += *count;
         }
@@ -227,8 +197,8 @@ impl<T: HistogramValue> Shard<T> {
 
     fn collect(&self, bucket_count: usize, waker: &AtomicWaker) -> (u64, f64, Vec<u64>) {
         let mut buckets = vec![0; bucket_count];
-        for _ in 0..SPIN_LOOP_LIMIT {
-            let count = self.count().load(Ordering::Acquire) & COUNT_MASK;
+        for _ in 0..Self::SPIN_LOOP_LIMIT {
+            let count = self.counters.count().load(Ordering::Acquire) & !Self::WAITING_FLAG;
             let (sum, expected_count) = self.read_sum_and_buckets(&mut buckets);
             if count == expected_count {
                 return (count, sum, buckets);
@@ -244,10 +214,14 @@ impl<T: HistogramValue> Shard<T> {
             waker.register(cx.waker());
             #[cfg(loom)]
             waker.register(cx.waker().clone());
-            let count = self.count().fetch_or(WAITING_FLAG, Ordering::Acquire) & COUNT_MASK;
+            let count = (self.counters.count()).fetch_or(Self::WAITING_FLAG, Ordering::Acquire)
+                & !Self::WAITING_FLAG;
             let (sum, expected_count) = self.read_sum_and_buckets(buckets);
             if count == expected_count {
-                if self.count().fetch_and(COUNT_MASK, Ordering::Relaxed) & WAITING_FLAG != 0 {
+                if (self.counters.count()).fetch_and(!Self::WAITING_FLAG, Ordering::Relaxed)
+                    & Self::WAITING_FLAG
+                    != 0
+                {
                     #[cfg(not(loom))]
                     waker.take();
                     #[cfg(loom)]
@@ -258,13 +232,24 @@ impl<T: HistogramValue> Shard<T> {
             Poll::Pending
         }))
     }
+
+    #[cfg(feature = "unsafe")]
+    fn drop(&mut self, bucket_count: usize) {
+        self.counters.drop(bucket_count);
+    }
 }
 
-impl<T, B> TypedMetric for Histogram<T, B> {
+#[cfg(feature = "prometheus-client")]
+impl<B: HistogramBuckets, const TRUSTED_BUCKETS: bool> TypedMetric
+    for Histogram<B, TRUSTED_BUCKETS>
+{
     const TYPE: MetricType = MetricType::Histogram;
 }
 
-impl<T: HistogramValue, B: HistogramBuckets<T>> EncodeMetric for Histogram<T, B> {
+#[cfg(feature = "prometheus-client")]
+impl<B: HistogramBuckets, const TRUSTED_BUCKETS: bool> EncodeMetric
+    for Histogram<B, TRUSTED_BUCKETS>
+{
     fn encode(&self, mut encoder: MetricEncoder) -> Result<(), Error> {
         let (count, sum, buckets) = self.collect();
         encoder.encode_histogram::<NoLabelSet>(sum, count, &buckets.collect::<Vec<_>>(), None)
@@ -275,102 +260,14 @@ impl<T: HistogramValue, B: HistogramBuckets<T>> EncodeMetric for Histogram<T, B>
     }
 }
 
-#[cfg(test)]
-mod tests {
-    #[cfg(not(loom))]
-    use std::thread;
+#[cfg(feature = "asm")]
+#[unsafe(no_mangle)]
+pub fn observe_f64(h: &Histogram<&[f64], { cfg!(feature = "unsafe") }>, v: f64) {
+    h.observe(v)
+}
 
-    use itertools::Itertools;
-    #[cfg(loom)]
-    use loom::{model, thread};
-
-    use crate::Histogram;
-
-    #[cfg(not(loom))]
-    fn model(f: impl Fn()) {
-        f();
-    }
-
-    #[test]
-    fn observe_and_collect() {
-        model(|| {
-            let histogram = Histogram::new([10, 100]);
-            let h1 = histogram.clone();
-            let h2 = histogram.clone();
-            let t1 = thread::spawn(move || h1.observe(42));
-            let t2 = thread::spawn(move || {
-                let (count, sum, buckets) = h2.collect();
-                (count, sum, buckets.collect_vec())
-            });
-            histogram.observe(7);
-            histogram.observe(80100);
-            t1.join().unwrap();
-            let (count, sum, buckets) = t2.join().unwrap();
-            assert!(count <= 3);
-            let [(10.0, b0), (100.0, b1), (f64::INFINITY, b2)] = buckets[..] else {
-                unreachable!()
-            };
-            assert_eq!(count, b0 + b1 + b2);
-            let if_bucket = |b, v| if b == 1 { v } else { 0.0 };
-            assert_eq!(
-                sum,
-                if_bucket(b0, 7.0) + if_bucket(b1, 42.0) + if_bucket(b2, 80100.0)
-            );
-            let (count, sum, buckets) = histogram.collect();
-            assert_eq!(count, 3);
-            assert_eq!(sum, 80149.0);
-            assert_eq!(
-                buckets.collect_vec(),
-                vec![(10.0, 1), (100.0, 1), (f64::INFINITY, 1)]
-            );
-        });
-    }
-
-    #[cfg(loom)]
-    #[test]
-    fn double_collect_edge_case() {
-        let edge_case = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let edge_case2 = edge_case.clone();
-        model(move || {
-            let histogram = Histogram::new([10, 100]);
-            let h1 = histogram.clone();
-            let t1 = thread::spawn(move || {
-                h1.observe(7);
-                h1.observe(42)
-            });
-            let (_, sum1, _) = histogram.collect();
-            let (_, sum2, _) = histogram.collect();
-            edge_case2.fetch_or(
-                sum1 == 0.0 && sum2 == 42.0,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            t1.join().unwrap();
-            let (_, sum, _) = histogram.collect();
-            assert_eq!(sum, 49.0);
-        });
-        assert!(edge_case.load(std::sync::atomic::Ordering::Relaxed));
-    }
-
-    #[cfg(not(loom))]
-    #[test]
-    fn observe_inf() {
-        let histogram = Histogram::new([1.0]);
-        histogram.observe(f64::INFINITY);
-        histogram.observe(1.0);
-        let (count, sum, buckets) = histogram.collect();
-        assert_eq!(count, 1);
-        assert_eq!(sum, f64::INFINITY);
-        assert_eq!(buckets.collect_vec(), vec![(1.0, 1), (f64::INFINITY, 1)]);
-    }
-
-    #[cfg(not(loom))]
-    #[test]
-    fn observe_nan() {
-        let histogram = Histogram::new([1.0]);
-        histogram.observe(f64::NAN);
-        let (count, sum, buckets) = histogram.collect();
-        assert_eq!(count, 1);
-        assert!(sum.is_nan());
-        assert_eq!(buckets.collect_vec(), vec![(1.0, 0), (f64::INFINITY, 0)]);
-    }
+#[cfg(feature = "asm")]
+#[unsafe(no_mangle)]
+pub fn observe_u64(h: &Histogram<&[u64], { cfg!(feature = "unsafe") }>, v: u64) {
+    h.observe(v)
 }

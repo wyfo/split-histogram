@@ -1,0 +1,49 @@
+observe_u64:
+	push rax
+	mov rdi, qword ptr [rdi]
+	mov rcx, qword ptr [rdi + 104]
+	test rcx, rcx
+	je .LBB6_4
+	mov rdx, qword ptr [rdi + 96]
+	shl rcx, 3
+	xor eax, eax
+.LBB6_2:
+	cmp rsi, qword ptr [rdx + 8*rax]
+	jbe .LBB6_5
+	inc rax
+	add rcx, -8
+	jne .LBB6_2
+.LBB6_4:
+	mov rax, qword ptr [rdi + 112]
+	dec rax
+.LBB6_5:
+	mov rcx, qword ptr [rdi + 120]
+	cmp rcx, 1
+	ja .LBB6_9
+	lea rdx, [rcx + 4*rcx]
+	mov rcx, qword ptr [rdi + 8*rdx + 32]
+	cmp rax, rcx
+	jae .LBB6_11
+	lea rcx, [rdi + 8*rdx]
+	add rcx, 16
+	mov rdx, qword ptr [rcx + 8]
+	lock inc	qword ptr [rdx + 8*rax]
+	lock add	qword ptr [rcx + 32], rsi
+	lock inc	qword ptr [rcx + 24]
+	jle .LBB6_8
+	pop rax
+	ret
+.LBB6_8:
+	add rdi, 136
+	pop rax
+	jmp qword ptr [rip + futures_core::task::__internal::atomic_waker::AtomicWaker::wake@GOTPCREL]
+.LBB6_9:
+	lea rdx, [rip + .Lanon.b9171e764d69c10047d444ed020cd4c9.6]
+	mov esi, 2
+	mov rdi, rcx
+	call qword ptr [rip + core::panicking::panic_bounds_check@GOTPCREL]
+.LBB6_11:
+	lea rdx, [rip + .Lanon.b9171e764d69c10047d444ed020cd4c9.3]
+	mov rdi, rax
+	mov rsi, rcx
+	call qword ptr [rip + core::panicking::panic_bounds_check@GOTPCREL]

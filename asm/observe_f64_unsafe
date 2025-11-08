@@ -1,0 +1,38 @@
+observe_f64:
+	mov rdi, qword ptr [rdi]
+	mov rcx, qword ptr [rdi + 24]
+	test rcx, rcx
+	je .LBB5_4
+	mov rdx, qword ptr [rdi + 16]
+	shl rcx, 3
+	xor eax, eax
+.LBB5_2:
+	movsd xmm1, qword ptr [rdx + 8*rax]
+	ucomisd xmm1, xmm0
+	jae .LBB5_5
+	inc rax
+	add rcx, -8
+	jne .LBB5_2
+.LBB5_4:
+	xor eax, eax
+	ucomisd xmm0, xmm0
+	setnp al
+	not rax
+	add rax, qword ptr [rdi + 32]
+.LBB5_5:
+	mov rcx, qword ptr [rdi + 40]
+	mov rcx, qword ptr [rdi + 8*rcx + 48]
+	lock inc	qword ptr [rcx + 8*rax + 16]
+	mov rax, qword ptr [rcx + 8]
+.LBB5_6:
+	movq xmm1, rax
+	addsd xmm1, xmm0
+	movq rdx, xmm1
+	lock cmpxchg	qword ptr [rcx + 8], rdx
+	jne .LBB5_6
+	lock inc	qword ptr [rcx]
+	jle .LBB5_9
+	ret
+.LBB5_9:
+	add rdi, 72
+	jmp qword ptr [rip + futures_core::task::__internal::atomic_waker::AtomicWaker::wake@GOTPCREL]

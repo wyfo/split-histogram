@@ -115,5 +115,9 @@ The additional atomic RMW in `go_observe` (the `_count` increment) has a measura
 
 Cache locality, enabled by grouping all shard counters in a single cache line, delivers consistent performance improvements across all platforms, significantly reducing the impact of cache line invalidation triggered by the contending thread.
 
+## Cache-Friendly vs. Naive Layout
+
+A "naive" shard layout — where buckets are not grouped with `_count` and `_sum` — can be enabled via the `naive` feature flag. Its performance matches `go_observe_no_count`, confirming the significant impact of cache locality.
+
 [^1]: On a MacBook Air M3, one `std::hint::spin_loop` call takes ~8 ns.
 [^2]: GitHub Actions workflow run: https://github.com/wyfo/split-histogram/actions/runs/18954432694

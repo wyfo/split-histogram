@@ -13,6 +13,7 @@ This repository is an experimental implementation of an optimized [Prometheus hi
   - [Avoiding Unbounded Spinning](#avoiding-unbounded-spinning)
   - [Cache Locality](#cache-locality)
   - [Testing](#testing)
+  - [Safety](#safety)
   - [NaN Support](#nan-support)
 - [Discussion](#discussion)
 - [Context](#context)
@@ -81,6 +82,15 @@ The algorithm’s correctness is validated under the [C++11 memory model](https:
 
 [Benchmark results](benches/README.md) highlight both the impact of reducing the number of atomic RMW and cache locality.
 
+## Safety
+
+The algorithm is implemented using **100% safe Rust**. However, the safe version includes redundant bounds checks and complex layout logic to group counters within a single cache line.
+
+An unsafe alternative is provided behind the `unsafe` feature flag, eliminating these overheads. The `unsafe` implementation is thoroughly validated using `miri`.
+
+While runtime performance is minimally affected, the generated assembly is significantly improved:  
+from [56 instructions](asm/observe_f64) (safe) to [32 instructions](asm/observe_f64_unsafe) (unsafe) per observation — enhancing inlining and code density.
+
 ### NaN Support
 
 `NaN` values are supported via a dedicated `NaN` bucket placed after `+Inf`, removed from the collection result.
@@ -96,6 +106,7 @@ Additionally, avoiding unbounded spinning here relies on a flag in the `_count` 
 ## Context
 
 This implementation was motivated by a project requiring millions of observations per second, where I needed to assess histogram latency impact. Reviewing the Rust Prometheus client source revealed a TODO linking to the Go client’s pull request. So I started to implement the Go algorithm into the Rust client, but I had the feeling doing it that there should be a way to use the redundancy between the bucket counters and the total counter. I have some experience in high-performance atomic algorithms, and the hot/cold sharding algorithm is quite similar to the one I use in [`swap-buffer-queue`](https://github.com/wyfo/swap-buffer-queue). I was influenced by the sharding idea, but I managed to turn it differently by splitting the counters across shards instead of replicating them. Cache locality then came as an added benefit.
+
 
 [^1]: There is no atomic FAA (Fetch-and-Add) defined for floats, so it’s implemented using a CAS (Compare-and-Swap) loop with an integer atomic field to store the float bytes. For the sake of simplicity, CAS failures and retries are ignored in the rest of the document.
 [^2]: Although the Go scheduler differs from the Linux scheduler and goroutines are often more numerous than threads, Linus Torvalds’ arguments still apply. The `runtime.Gosched` function doesn’t seem to be designed for spin-lock mechanisms but rather for yielding in long-running, low-priority goroutines. A mechanism like this implementation’s, using a flag on the `_count` counter and a channel for notification, avoids these issues.

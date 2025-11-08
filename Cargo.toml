@@ -5,7 +5,10 @@ edition = "2024"
 
 [features]
 default = ["prometheus-client"]
+asm = []
+naive = []
 prometheus-client = ["dep:prometheus-client"]
+unsafe = []
 
 [dependencies]
 crossbeam-utils = "0.8"
