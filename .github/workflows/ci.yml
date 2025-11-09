@@ -8,33 +8,42 @@ on:
 
 jobs:
   check:
+    strategy:
+      matrix:
+        features: ["", "--features=unsafe", "--features=naive"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: rustfmt
         run: cargo fmt -- --config "unstable_features=true,imports_granularity=Crate,group_imports=StdExternalCrate,format_code_in_doc_comments=true"
       - name: clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets ${{ matrix.features }} -- -D warnings
       - name: test
-        run: cargo test
+        run: cargo test ${{ matrix.features }}
   miri:
     needs: check
+    strategy:
+      matrix:
+        features: ["", "--features unsafe", "--features naive"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: install miri
         run: rustup install nightly && rustup +nightly component add miri
       - name: miri
-        run: cargo +nightly miri test
+        run: cargo +nightly miri test ${{ matrix.features }}
         env:
           MIRIFLAGS: "-Zmiri-many-seeds=0..256"
   loom:
     needs: check
+    strategy:
+      matrix:
+        features: ["", "--features unsafe", "--features naive"]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
       - name: loom
-        run: cargo test --release --lib
+        run: cargo test --release --lib ${{ matrix.features }}
         env:
           RUSTFLAGS: "--cfg loom"
           LOOM_MAX_PREEMPTIONS: "3"

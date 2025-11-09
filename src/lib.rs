@@ -40,7 +40,6 @@ pub trait HistogramValue {
     fn from_bits(bits: u64) -> Self;
 }
 
-#[expect(clippy::len_without_is_empty)]
 pub trait HistogramBuckets {
     type Value: HistogramValue;
     fn bucket_index(&self, value: &Self::Value) -> Option<usize>;
