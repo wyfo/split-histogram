@@ -82,7 +82,7 @@ The algorithm’s correctness is validated under the [C++11 memory model](https:
 
 [Benchmark results](benches/README.md) highlight both the impact of reducing the number of atomic RMW and cache locality.
 
-## Safety
+### Safety
 
 The algorithm is implemented using **100% safe Rust**. However, the safe version includes redundant bounds checks and complex layout logic to group counters within a single cache line.
 
